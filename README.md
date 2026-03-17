@@ -8,6 +8,12 @@
 - ปรับ `Exposure` เพื่อดูภาพ HDR บนจอปกติ
 - บันทึกภาพ preview ออกเป็น JPG
 
+## Install
+
+```powershell
+pip install -r .\requirements.txt
+```
+
 ## Run
 
 ```powershell
