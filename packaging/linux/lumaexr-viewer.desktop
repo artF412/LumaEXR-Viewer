@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=LumaEXR Viewer
+Comment=OpenEXR HDR viewer
+Exec=lumaexr-viewer
+Icon=lumaexr-viewer
+Terminal=false
+Type=Application
+Categories=Graphics;Viewer;
+StartupNotify=true

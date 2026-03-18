@@ -3,3 +3,12 @@
 !README.md
 !luma_exr_viewer.py
 !requirements.txt
+!build_exe.bat
+!LumaEXR-Viewer.spec
+!pyi_rth_tk_env.py
+!hooks/
+!hooks/**
+!packaging/
+!packaging/**
+__pycache__/
+*.pyc

@@ -1,6 +1,7 @@
 import argparse
 import os
 import queue
+import sys
 import threading
 from pathlib import Path
 from typing import Optional
@@ -15,9 +16,17 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_NAME = "LumaEXR Viewer"
-APP_ICON_PATH = Path(__file__).with_name("assets") / "app_icon.png"
 CANVAS_BG = "#f3efe8"
 CANVAS_TEXT = "#7a6f64"
+
+
+def get_runtime_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS"))
+    return Path(__file__).resolve().parent
+
+
+APP_ICON_PATH = get_runtime_base_dir() / "assets" / "app_icon.png"
 
 
 def clamp_highlights(rgb: np.ndarray, percentile: float = 99.97) -> np.ndarray:
