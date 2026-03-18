@@ -14,6 +14,8 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "LumaEXR Viewer"
 APP_ICON_PATH = Path(__file__).with_name("assets") / "app_icon.png"
+CANVAS_BG = "#f3efe8"
+CANVAS_TEXT = "#7a6f64"
 
 
 def clamp_highlights(rgb: np.ndarray, percentile: float = 99.97) -> np.ndarray:
@@ -105,10 +107,19 @@ class HDRViewerApp:
         self.preview_ref: Optional[ImageTk.PhotoImage] = None
         self.preview_image: Optional[np.ndarray] = None
         self.refresh_job: Optional[str] = None
+        self.zoom_factor = 1.0
+        self.fit_zoom = 1.0
+        self.display_width = 0
+        self.display_height = 0
+        self.display_offset_x = 0
+        self.display_offset_y = 0
+        self.scroll_width = 0
+        self.scroll_height = 0
 
         self.exposure_var = tk.DoubleVar(value=0.0)
         self.clamp_var = tk.BooleanVar(value=True)
         self.denoise_var = tk.BooleanVar(value=True)
+        self.zoom_text = tk.StringVar(value="100%")
 
         self._set_app_icon()
         self._build_layout()
@@ -143,7 +154,11 @@ class HDRViewerApp:
         ttk.Checkbutton(toolbar, text="Denoise Speckles", variable=self.denoise_var, command=self.schedule_preview_refresh).grid(
             row=0, column=5, sticky="w", padx=(12, 0)
         )
-        ttk.Button(toolbar, text="Save JPG", command=self.save_jpg).grid(row=0, column=6, sticky="e", padx=(12, 0))
+        ttk.Button(toolbar, text="Zoom -", command=lambda: self.change_zoom(0.8)).grid(row=0, column=6, sticky="w", padx=(12, 0))
+        ttk.Button(toolbar, text="Zoom +", command=lambda: self.change_zoom(1.25)).grid(row=0, column=7, sticky="w", padx=(8, 0))
+        ttk.Button(toolbar, text="Fit", command=self.reset_zoom_to_fit).grid(row=0, column=8, sticky="w", padx=(8, 0))
+        ttk.Label(toolbar, textvariable=self.zoom_text, width=8).grid(row=0, column=9, sticky="w", padx=(8, 0))
+        ttk.Button(toolbar, text="Save JPG", command=self.save_jpg).grid(row=0, column=10, sticky="e", padx=(12, 0))
 
         self.exposure_text = tk.StringVar(value="0.00 EV")
         ttk.Label(toolbar, textvariable=self.exposure_text, width=10).grid(row=0, column=3, sticky="w", padx=(10, 0))
@@ -151,10 +166,27 @@ class HDRViewerApp:
         self.path_var = tk.StringVar(value="No file selected")
         ttk.Label(self.root, textvariable=self.path_var, padding=(12, 0, 12, 8)).grid(row=2, column=0, sticky="ew")
 
-        self.image_label = ttk.Label(self.root, anchor="center")
-        self.image_label.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        viewer_frame = ttk.Frame(self.root)
+        viewer_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        viewer_frame.columnconfigure(0, weight=1)
+        viewer_frame.rowconfigure(0, weight=1)
+
+        self.image_canvas = tk.Canvas(viewer_frame, background=CANVAS_BG, highlightthickness=0)
+        self.image_canvas.grid(row=0, column=0, sticky="nsew")
+
+        self.y_scroll = ttk.Scrollbar(viewer_frame, orient="vertical", command=self.image_canvas.yview)
+        self.y_scroll.grid(row=0, column=1, sticky="ns")
+        self.x_scroll = ttk.Scrollbar(viewer_frame, orient="horizontal", command=self.image_canvas.xview)
+        self.x_scroll.grid(row=1, column=0, sticky="ew")
+        self.image_canvas.configure(xscrollcommand=self.x_scroll.set, yscrollcommand=self.y_scroll.set)
+
+        self.image_canvas.bind("<Configure>", self._on_canvas_resize)
+        self.image_canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.image_canvas.bind("<ButtonPress-1>", self._on_pan_start)
+        self.image_canvas.bind("<B1-Motion>", self._on_pan_move)
 
         self.exposure_var.trace_add("write", lambda *_: self.schedule_preview_refresh())
+        self._draw_empty_state()
 
     def ask_open(self) -> None:
         path = filedialog.askopenfilename(
@@ -191,7 +223,16 @@ class HDRViewerApp:
         self.refresh_job = None
         self.exposure_text.set(f"{self.exposure_var.get():.2f} EV")
         if self.preview_rgb is None:
+            self._draw_empty_state()
             return
+
+        preserve_view = self.preview_image is not None
+        view_x: Optional[float] = None
+        view_y: Optional[float] = None
+
+        if preserve_view:
+            view_x = self.image_canvas.xview()[0]
+            view_y = self.image_canvas.yview()[0]
 
         processed = prepare_display_image(
             self.preview_rgb,
@@ -200,9 +241,192 @@ class HDRViewerApp:
         )
         preview = tone_map(processed, self.exposure_var.get())
         self.preview_image = preview
-        photo = ImageTk.PhotoImage(Image.fromarray(preview))
+        self._update_fit_zoom()
+        self._render_canvas_image(
+            reset_zoom=not preserve_view,
+            view_x=view_x,
+            view_y=view_y,
+        )
+
+    def _draw_empty_state(self) -> None:
+        self.image_canvas.delete("all")
+        canvas_width = max(self.image_canvas.winfo_width(), 1)
+        canvas_height = max(self.image_canvas.winfo_height(), 1)
+        center_x = canvas_width // 2
+        center_y = canvas_height // 2
+        self.image_canvas.create_text(
+            center_x,
+            center_y - 14,
+            text="Open an EXR file to start",
+            fill=CANVAS_TEXT,
+            font=("Segoe UI", 18, "bold"),
+        )
+        self.image_canvas.create_text(
+            center_x,
+            center_y + 18,
+            text="Mouse wheel to zoom, drag to pan",
+            fill=CANVAS_TEXT,
+            font=("Segoe UI", 11),
+        )
+        self.image_canvas.configure(scrollregion=(0, 0, canvas_width, canvas_height))
+        self.x_scroll.set(0.0, 1.0)
+        self.y_scroll.set(0.0, 1.0)
+        self.zoom_text.set("Fit")
+
+    def _render_canvas_image(
+        self,
+        reset_zoom: bool = False,
+        anchor_canvas_x: Optional[float] = None,
+        anchor_canvas_y: Optional[float] = None,
+        anchor_image_u: Optional[float] = None,
+        anchor_image_v: Optional[float] = None,
+        view_x: Optional[float] = None,
+        view_y: Optional[float] = None,
+    ) -> None:
+        if self.preview_image is None:
+            return
+
+        if reset_zoom:
+            self._update_fit_zoom()
+            self.zoom_factor = 1.0
+
+        base_height, base_width = self.preview_image.shape[:2]
+        display_zoom = max(self.fit_zoom * self.zoom_factor, 0.05)
+        display_width = max(1, int(base_width * display_zoom))
+        display_height = max(1, int(base_height * display_zoom))
+        canvas_width = max(self.image_canvas.winfo_width(), 1)
+        canvas_height = max(self.image_canvas.winfo_height(), 1)
+
+        interpolation = cv2.INTER_LINEAR if display_zoom >= 1.0 else cv2.INTER_AREA
+        display_image = cv2.resize(self.preview_image, (display_width, display_height), interpolation=interpolation)
+        offset_x = max((canvas_width - display_width) // 2, 0)
+        offset_y = max((canvas_height - display_height) // 2, 0)
+        scroll_width = max(display_width, canvas_width)
+        scroll_height = max(display_height, canvas_height)
+        self.display_width = display_width
+        self.display_height = display_height
+        self.display_offset_x = offset_x
+        self.display_offset_y = offset_y
+        self.scroll_width = scroll_width
+        self.scroll_height = scroll_height
+
+        photo = ImageTk.PhotoImage(Image.fromarray(display_image))
         self.preview_ref = photo
-        self.image_label.configure(image=photo)
+        self.image_canvas.delete("all")
+        self.image_canvas.create_image(offset_x, offset_y, anchor="nw", image=photo)
+        self.image_canvas.configure(scrollregion=(0, 0, scroll_width, scroll_height))
+
+        if (
+            anchor_canvas_x is not None
+            and anchor_canvas_y is not None
+            and anchor_image_u is not None
+            and anchor_image_v is not None
+        ):
+            self._restore_view_anchor(anchor_canvas_x, anchor_canvas_y, anchor_image_u, anchor_image_v)
+        elif view_x is not None and view_y is not None:
+            self._restore_view_fraction(view_x, view_y)
+        elif reset_zoom:
+            self._center_view()
+
+        self.zoom_text.set(f"{display_zoom * 100:.0f}%")
+
+    def _center_view(self) -> None:
+        canvas_width = max(self.image_canvas.winfo_width(), 1)
+        canvas_height = max(self.image_canvas.winfo_height(), 1)
+        if self.scroll_width > canvas_width:
+            left = max((self.scroll_width - canvas_width) / 2.0, 0.0)
+            self.image_canvas.xview_moveto(left / max(self.scroll_width, 1))
+        else:
+            self.image_canvas.xview_moveto(0.0)
+        if self.scroll_height > canvas_height:
+            top = max((self.scroll_height - canvas_height) / 2.0, 0.0)
+            self.image_canvas.yview_moveto(top / max(self.scroll_height, 1))
+        else:
+            self.image_canvas.yview_moveto(0.0)
+
+    def _capture_anchor(self, canvas_x: float, canvas_y: float) -> tuple[float, float]:
+        content_x = self.image_canvas.canvasx(canvas_x)
+        content_y = self.image_canvas.canvasy(canvas_y)
+        image_u = (content_x - self.display_offset_x) / max(self.display_width, 1)
+        image_v = (content_y - self.display_offset_y) / max(self.display_height, 1)
+        return image_u, image_v
+
+    def _restore_view_anchor(self, canvas_x: float, canvas_y: float, image_u: float, image_v: float) -> None:
+        canvas_width = max(self.image_canvas.winfo_width(), 1)
+        canvas_height = max(self.image_canvas.winfo_height(), 1)
+        target_x = self.display_offset_x + image_u * self.display_width
+        target_y = self.display_offset_y + image_v * self.display_height
+        left = target_x - canvas_x
+        top = target_y - canvas_y
+        max_left = max(self.scroll_width - canvas_width, 0)
+        max_top = max(self.scroll_height - canvas_height, 0)
+        left = min(max(left, 0.0), max_left)
+        top = min(max(top, 0.0), max_top)
+        self.image_canvas.xview_moveto(0.0 if self.scroll_width <= canvas_width else left / self.scroll_width)
+        self.image_canvas.yview_moveto(0.0 if self.scroll_height <= canvas_height else top / self.scroll_height)
+
+    def _restore_view_fraction(self, view_x: float, view_y: float) -> None:
+        self.image_canvas.xview_moveto(min(max(view_x, 0.0), 1.0))
+        self.image_canvas.yview_moveto(min(max(view_y, 0.0), 1.0))
+
+    def _update_fit_zoom(self) -> None:
+        if self.preview_image is None:
+            self.fit_zoom = 1.0
+            return
+
+        canvas_width = max(self.image_canvas.winfo_width(), 1)
+        canvas_height = max(self.image_canvas.winfo_height(), 1)
+        image_height, image_width = self.preview_image.shape[:2]
+        self.fit_zoom = min(canvas_width / image_width, canvas_height / image_height)
+
+    def _on_canvas_resize(self, _event: tk.Event) -> None:
+        if self.preview_image is None:
+            self._draw_empty_state()
+            return
+        previous_fit = self.fit_zoom
+        self._update_fit_zoom()
+        if abs(previous_fit - self.fit_zoom) > 1e-3 and self.zoom_factor == 1.0:
+            self._render_canvas_image(reset_zoom=False)
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        if self.preview_image is None:
+            return
+        factor = 1.1 if event.delta > 0 else 1.0 / 1.1
+        self.change_zoom(factor, anchor_canvas_x=event.x, anchor_canvas_y=event.y)
+
+    def _on_pan_start(self, event: tk.Event) -> None:
+        self.image_canvas.scan_mark(event.x, event.y)
+
+    def _on_pan_move(self, event: tk.Event) -> None:
+        self.image_canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def change_zoom(
+        self,
+        factor: float,
+        anchor_canvas_x: Optional[float] = None,
+        anchor_canvas_y: Optional[float] = None,
+    ) -> None:
+        if self.preview_image is None:
+            return
+        if anchor_canvas_x is None or anchor_canvas_y is None:
+            anchor_canvas_x = self.image_canvas.winfo_width() / 2.0
+            anchor_canvas_y = self.image_canvas.winfo_height() / 2.0
+
+        image_u, image_v = self._capture_anchor(anchor_canvas_x, anchor_canvas_y)
+        self.zoom_factor = min(max(self.zoom_factor * factor, 0.25), 16.0)
+        self._render_canvas_image(
+            reset_zoom=False,
+            anchor_canvas_x=anchor_canvas_x,
+            anchor_canvas_y=anchor_canvas_y,
+            anchor_image_u=image_u,
+            anchor_image_v=image_v,
+        )
+
+    def reset_zoom_to_fit(self) -> None:
+        if self.preview_image is None:
+            return
+        self.zoom_factor = 1.0
+        self._render_canvas_image(reset_zoom=False)
 
     def save_jpg(self) -> None:
         if self.image_rgb is None or self.current_path is None:
