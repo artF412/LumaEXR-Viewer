@@ -6,6 +6,9 @@
 !build_exe.bat
 !LumaEXR-Viewer.spec
 !pyi_rth_tk_env.py
+!assets/
+!assets/app_icon.png
+!assets/app_icon.ico
 !hooks/
 !hooks/**
 !packaging/
