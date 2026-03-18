@@ -1,5 +1,7 @@
 import argparse
 import os
+import queue
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -107,6 +109,9 @@ class HDRViewerApp:
         self.preview_ref: Optional[ImageTk.PhotoImage] = None
         self.preview_image: Optional[np.ndarray] = None
         self.refresh_job: Optional[str] = None
+        self.load_queue: queue.Queue = queue.Queue()
+        self.load_request_id = 0
+        self.is_loading = False
         self.zoom_factor = 1.0
         self.fit_zoom = 1.0
         self.display_width = 0
@@ -123,6 +128,7 @@ class HDRViewerApp:
 
         self._set_app_icon()
         self._build_layout()
+        self.root.after(50, self._poll_load_queue)
 
         if initial_path:
             self.open_path(initial_path)
@@ -145,20 +151,28 @@ class HDRViewerApp:
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(3, weight=1)
 
-        ttk.Button(toolbar, text="Open EXR", command=self.ask_open).grid(row=0, column=0, sticky="w")
+        self.open_button = ttk.Button(toolbar, text="Open EXR", command=self.ask_open)
+        self.open_button.grid(row=0, column=0, sticky="w")
         ttk.Label(toolbar, text="Exposure").grid(row=0, column=1, sticky="w", padx=(16, 8))
-        ttk.Scale(toolbar, variable=self.exposure_var, from_=-6.0, to=6.0).grid(row=0, column=2, sticky="ew")
-        ttk.Checkbutton(toolbar, text="Clamp Highlights", variable=self.clamp_var, command=self.schedule_preview_refresh).grid(
+        self.exposure_scale = ttk.Scale(toolbar, variable=self.exposure_var, from_=-6.0, to=6.0)
+        self.exposure_scale.grid(row=0, column=2, sticky="ew")
+        self.clamp_check = ttk.Checkbutton(toolbar, text="Clamp Highlights", variable=self.clamp_var, command=self.schedule_preview_refresh)
+        self.clamp_check.grid(
             row=0, column=4, sticky="w", padx=(12, 0)
         )
-        ttk.Checkbutton(toolbar, text="Denoise Speckles", variable=self.denoise_var, command=self.schedule_preview_refresh).grid(
+        self.denoise_check = ttk.Checkbutton(toolbar, text="Denoise Speckles", variable=self.denoise_var, command=self.schedule_preview_refresh)
+        self.denoise_check.grid(
             row=0, column=5, sticky="w", padx=(12, 0)
         )
-        ttk.Button(toolbar, text="Zoom -", command=lambda: self.change_zoom(0.8)).grid(row=0, column=6, sticky="w", padx=(12, 0))
-        ttk.Button(toolbar, text="Zoom +", command=lambda: self.change_zoom(1.25)).grid(row=0, column=7, sticky="w", padx=(8, 0))
-        ttk.Button(toolbar, text="Fit", command=self.reset_zoom_to_fit).grid(row=0, column=8, sticky="w", padx=(8, 0))
+        self.zoom_out_button = ttk.Button(toolbar, text="Zoom -", command=lambda: self.change_zoom(0.8))
+        self.zoom_out_button.grid(row=0, column=6, sticky="w", padx=(12, 0))
+        self.zoom_in_button = ttk.Button(toolbar, text="Zoom +", command=lambda: self.change_zoom(1.25))
+        self.zoom_in_button.grid(row=0, column=7, sticky="w", padx=(8, 0))
+        self.fit_button = ttk.Button(toolbar, text="Fit", command=self.reset_zoom_to_fit)
+        self.fit_button.grid(row=0, column=8, sticky="w", padx=(8, 0))
         ttk.Label(toolbar, textvariable=self.zoom_text, width=8).grid(row=0, column=9, sticky="w", padx=(8, 0))
-        ttk.Button(toolbar, text="Save JPG", command=self.save_jpg).grid(row=0, column=10, sticky="e", padx=(12, 0))
+        self.save_button = ttk.Button(toolbar, text="Save JPG", command=self.save_jpg)
+        self.save_button.grid(row=0, column=10, sticky="e", padx=(12, 0))
 
         self.exposure_text = tk.StringVar(value="0.00 EV")
         ttk.Label(toolbar, textvariable=self.exposure_text, width=10).grid(row=0, column=3, sticky="w", padx=(10, 0))
@@ -189,6 +203,8 @@ class HDRViewerApp:
         self._draw_empty_state()
 
     def ask_open(self) -> None:
+        if self.is_loading:
+            return
         path = filedialog.askopenfilename(
             title="Open EXR / HDR image",
             filetypes=[
@@ -202,18 +218,69 @@ class HDRViewerApp:
             self.open_path(path)
 
     def open_path(self, path: str) -> None:
-        try:
-            self.image_rgb = load_exr(path)
-        except Exception as exc:
-            messagebox.showerror("Open EXR failed", str(exc))
-            return
+        self.load_request_id += 1
+        request_id = self.load_request_id
+        self.is_loading = True
+        self._set_controls_enabled(False)
+        self.path_var.set(f"Loading {Path(path).name}...")
+        self._draw_loading_state(f"Loading {Path(path).name}")
+        worker = threading.Thread(target=self._load_exr_worker, args=(path, request_id), daemon=True)
+        worker.start()
 
-        self.preview_rgb = resize_for_preview(self.image_rgb)
-        self.current_path = path
-        self.path_var.set(str(Path(path).resolve()))
-        self.refresh_preview()
+    def _load_exr_worker(self, path: str, request_id: int) -> None:
+        try:
+            image_rgb = load_exr(path)
+            preview_rgb = resize_for_preview(image_rgb)
+        except Exception as exc:
+            self.load_queue.put(("error", request_id, path, str(exc)))
+            return
+        self.load_queue.put(("success", request_id, path, image_rgb, preview_rgb))
+
+    def _poll_load_queue(self) -> None:
+        try:
+            while True:
+                item = self.load_queue.get_nowait()
+                status = item[0]
+                request_id = item[1]
+                if request_id != self.load_request_id:
+                    continue
+                if status == "error":
+                    _, _, path, error_message = item
+                    self.is_loading = False
+                    self._set_controls_enabled(True)
+                    self.path_var.set(str(Path(path).resolve()))
+                    self._draw_empty_state()
+                    messagebox.showerror("Open EXR failed", error_message)
+                else:
+                    _, _, path, image_rgb, preview_rgb = item
+                    self.is_loading = False
+                    self._set_controls_enabled(True)
+                    self.image_rgb = image_rgb
+                    self.preview_rgb = preview_rgb
+                    self.current_path = path
+                    self.path_var.set(str(Path(path).resolve()))
+                    self.refresh_preview()
+        except queue.Empty:
+            pass
+        self.root.after(50, self._poll_load_queue)
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for widget in (
+            self.open_button,
+            self.exposure_scale,
+            self.clamp_check,
+            self.denoise_check,
+            self.zoom_out_button,
+            self.zoom_in_button,
+            self.fit_button,
+            self.save_button,
+        ):
+            widget.configure(state=state)
 
     def schedule_preview_refresh(self) -> None:
+        if self.is_loading:
+            return
         self.exposure_text.set(f"{self.exposure_var.get():.2f} EV")
         if self.refresh_job is not None:
             self.root.after_cancel(self.refresh_job)
@@ -272,6 +339,31 @@ class HDRViewerApp:
         self.x_scroll.set(0.0, 1.0)
         self.y_scroll.set(0.0, 1.0)
         self.zoom_text.set("Fit")
+
+    def _draw_loading_state(self, title: str) -> None:
+        self.image_canvas.delete("all")
+        canvas_width = max(self.image_canvas.winfo_width(), 1)
+        canvas_height = max(self.image_canvas.winfo_height(), 1)
+        center_x = canvas_width // 2
+        center_y = canvas_height // 2
+        self.image_canvas.create_text(
+            center_x,
+            center_y - 14,
+            text=title,
+            fill=CANVAS_TEXT,
+            font=("Segoe UI", 18, "bold"),
+        )
+        self.image_canvas.create_text(
+            center_x,
+            center_y + 18,
+            text="Reading HDR data and building preview...",
+            fill=CANVAS_TEXT,
+            font=("Segoe UI", 11),
+        )
+        self.image_canvas.configure(scrollregion=(0, 0, canvas_width, canvas_height))
+        self.x_scroll.set(0.0, 1.0)
+        self.y_scroll.set(0.0, 1.0)
+        self.zoom_text.set("...")
 
     def _render_canvas_image(
         self,
@@ -380,6 +472,9 @@ class HDRViewerApp:
         self.fit_zoom = min(canvas_width / image_width, canvas_height / image_height)
 
     def _on_canvas_resize(self, _event: tk.Event) -> None:
+        if self.is_loading:
+            self._draw_loading_state("Loading EXR...")
+            return
         if self.preview_image is None:
             self._draw_empty_state()
             return
@@ -389,15 +484,19 @@ class HDRViewerApp:
             self._render_canvas_image(reset_zoom=False)
 
     def _on_mousewheel(self, event: tk.Event) -> None:
-        if self.preview_image is None:
+        if self.preview_image is None or self.is_loading:
             return
         factor = 1.1 if event.delta > 0 else 1.0 / 1.1
         self.change_zoom(factor, anchor_canvas_x=event.x, anchor_canvas_y=event.y)
 
     def _on_pan_start(self, event: tk.Event) -> None:
+        if self.is_loading:
+            return
         self.image_canvas.scan_mark(event.x, event.y)
 
     def _on_pan_move(self, event: tk.Event) -> None:
+        if self.is_loading:
+            return
         self.image_canvas.scan_dragto(event.x, event.y, gain=1)
 
     def change_zoom(
@@ -406,7 +505,7 @@ class HDRViewerApp:
         anchor_canvas_x: Optional[float] = None,
         anchor_canvas_y: Optional[float] = None,
     ) -> None:
-        if self.preview_image is None:
+        if self.preview_image is None or self.is_loading:
             return
         if anchor_canvas_x is None or anchor_canvas_y is None:
             anchor_canvas_x = self.image_canvas.winfo_width() / 2.0
@@ -423,7 +522,7 @@ class HDRViewerApp:
         )
 
     def reset_zoom_to_fit(self) -> None:
-        if self.preview_image is None:
+        if self.preview_image is None or self.is_loading:
             return
         self.zoom_factor = 1.0
         self._render_canvas_image(reset_zoom=False)
